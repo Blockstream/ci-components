@@ -509,38 +509,74 @@ jobs:
               if not (root / "index.json").is_file() or not (root / "oci-layout").is_file():
                   raise SystemExit("Missing OCI layout metadata")
 
+          MANIFEST_TYPES = ("application/vnd.oci.image.manifest.v1+json",
+                            "application/vnd.docker.distribution.manifest.v2+json")
+          DESCRIPTOR = {"mediaType", "digest", "size", "urls", "annotations", "platform", "artifactType", "data"}
+          FIELDS = {
+              "index": {"schemaVersion", "mediaType", "manifests", "annotations", "artifactType", "subject"},
+              "manifest": {"schemaVersion", "mediaType", "config", "layers", "annotations", "artifactType", "subject"},
+              "config": {"architecture", "os", "os.version", "os.features", "variant", "config", "rootfs",
+                         "history", "created", "author"},
+          }
+
+          def strict_json(data):
+              def pairs(items):
+                  keys = [key for key, _ in items]
+                  if len(keys) != len(set(keys)):
+                      raise SystemExit("Duplicate key in OCI JSON")
+                  return dict(items)
+              return json.loads(data, object_pairs_hook=pairs)
+
+          def canonical(value, fields):
+              # crane decodes with Go, which matches keys case-insensitively (with
+              # Unicode folding). Reject keys that Go could read as another field.
+              if not isinstance(value, dict):
+                  raise SystemExit("Invalid OCI JSON object")
+              folded = [key.casefold() for key in value]
+              known = {field.casefold(): field for field in fields}
+              if len(folded) != len(set(folded)) or any(
+                      fold in known and key != known[fold] for key, fold in zip(value, folded)):
+                  raise SystemExit("Non-canonical OCI JSON key")
+              return value
+
           def local_blob(root, descriptor):
               # Blob names were checked against their content during unpack.
+              canonical(descriptor, DESCRIPTOR)
               digest = descriptor.get("digest", "")
               size = descriptor.get("size")
-              if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest) or descriptor.get("urls"):
+              if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest) \
+                      or "urls" in descriptor or "data" in descriptor:
                   raise SystemExit("Invalid OCI descriptor")
               blob = root / "blobs/sha256" / digest.split(":")[1]
-              if not isinstance(size, int) or not blob.is_file() or blob.stat().st_size != size:
+              if type(size) is not int or not blob.is_file() or blob.stat().st_size != size:
                   raise SystemExit("OCI blob is missing or has the wrong size")
               return blob
 
-          def read_descriptor(root, descriptor):
+          def read_descriptor(root, descriptor, kind):
               # Manifests and configs are small JSON; never read a layer into memory.
               blob = local_blob(root, descriptor)
               if descriptor["size"] > 4 * 1024**2:
                   raise SystemExit("OCI manifest or config is too large")
-              return json.loads(blob.read_bytes())
+              return canonical(strict_json(blob.read_bytes()), FIELDS[kind])
 
           def single_image(root):
               # Every blob the image references must be in this artifact. Otherwise
               # publish could sign a digest that only exists in the registry.
-              if json.loads((root / "oci-layout").read_bytes()) != {"imageLayoutVersion": "1.0.0"}:
+              if strict_json((root / "oci-layout").read_bytes()) != {"imageLayoutVersion": "1.0.0"}:
                   raise SystemExit("Unsupported OCI layout version")
-              index = json.loads((root / "index.json").read_bytes())
-              if index.get("schemaVersion") != 2 or len(index.get("manifests", [])) != 1:
+              index = canonical(strict_json((root / "index.json").read_bytes()), FIELDS["index"])
+              if index.get("schemaVersion") != 2 or not isinstance(index.get("manifests"), list) \
+                      or len(index["manifests"]) != 1:
                   raise SystemExit("Each OCI archive must contain exactly one image manifest")
               descriptor = index["manifests"][0]
-              if descriptor.get("mediaType") not in ("application/vnd.oci.image.manifest.v1+json",
-                                                    "application/vnd.docker.distribution.manifest.v2+json"):
+              if canonical(descriptor, DESCRIPTOR).get("mediaType") not in MANIFEST_TYPES:
                   raise SystemExit("Expected an image manifest")
-              manifest = read_descriptor(root, descriptor)
-              config = read_descriptor(root, manifest.get("config", {}))
+              manifest = read_descriptor(root, descriptor, "manifest")
+              # The blob itself must be the image manifest its descriptor claims, not an index.
+              if manifest.get("schemaVersion") != 2 or manifest.get("mediaType") != descriptor["mediaType"] \
+                      or any(key.casefold() == "manifests" for key in manifest):
+                  raise SystemExit("OCI manifest does not match its descriptor")
+              config = read_descriptor(root, manifest.get("config"), "config")
               layers = manifest.get("layers")
               if not isinstance(layers, list):
                   raise SystemExit("Invalid image manifest")
