@@ -9,8 +9,8 @@ name: Build, publish and sign an image
 # and signs the pushed digest with keyless cosign (GitHub OIDC).
 #
 # Each caller passes its own workload identity provider, service account and
-# image as inputs (for example from repository variables), so this public
-# workflow names no internal resources. Which repository, ref and environment
+# image as inputs or secrets, so this public workflow names no internal
+# resources. Which repository, ref and environment
 # may publish where is enforced outside this file: the provider's attribute
 # condition, the service account's workload identity binding and the
 # environment's deployment branch policy.
@@ -21,17 +21,40 @@ on:
       workload-identity-provider:
         description: Full workload identity provider name, projects/<number>/locations/global/workloadIdentityPools/<pool>/providers/<provider>
         type: string
-        required: true
+        required: false
+        default: ''
       service-account:
         description: Service account to impersonate for the push, <name>@<project>.iam.gserviceaccount.com
         type: string
-        required: true
+        required: false
+        default: ''
       image:
         description: Image to publish without tag, <region>-docker.pkg.dev/<project>/<repository>/<image>
         type: string
-        required: true
+        required: false
+        default: ''
+      image-name:
+        description: Optional public image path appended to the resolved image repository prefix
+        type: string
+        default: ''
+      tags:
+        description: Newline-separated explicit tags, replacing the derived tag
+        type: string
+        default: ''
+      moving-tags:
+        description: Newline-separated subset of explicit tags allowed to change digest
+        type: string
+        default: ''
+      platforms:
+        description: Newline-separated native platforms (linux/amd64 and linux/arm64); empty keeps the default build
+        type: string
+        default: ''
+      build-args:
+        description: Newline-separated literal KEY=VALUE build arguments (public values only)
+        type: string
+        default: ''
       environment:
-        description: Caller environment of the publish job, e.g. staging or production. The tag gets a prod- prefix for production.
+        description: Caller environment of the publish job. Derived tags get a prod- prefix for production.
         type: string
         required: true
       build-environment:
@@ -62,8 +85,17 @@ on:
         description: Newline-separated secret names to pass as build arguments (deprecated, use build-secrets)
         type: string
         default: ''
-    # Callers that request build secrets use `secrets: inherit`. Secrets are
-    # resolved only inside build; publish never receives the secrets context.
+    # Callers may pass publisher settings explicitly or inherit secrets.
+    secrets:
+      workload-identity-provider:
+        description: Fallback workload identity provider when the input is empty
+        required: false
+      service-account:
+        description: Fallback publisher service account when the input is empty
+        required: false
+      image:
+        description: Fallback image or repository prefix when the input is empty
+        required: false
     outputs:
       digest:
         description: Published image digest
@@ -79,10 +111,90 @@ defaults:
     shell: bash
 
 jobs:
-  build:
-    # Forks skip instead of failing at authentication.
+  prepare:
+    # Keep the same caller-owner guard before scheduling any builds.
     if: contains(fromJSON('["Blockstream", "BlockstreamResearch"]'), github.repository_owner)
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      platforms: ${{ steps.plan.outputs.platforms }}
+      artifact-prefix: ${{ steps.plan.outputs.artifact-prefix }}
+      tags: ${{ steps.plan.outputs.tags }}
+      moving-tags: ${{ steps.plan.outputs.moving-tags }}
+    steps:
+      - name: Validate public inputs and select native runners
+        id: plan
+        env:
+          DEPLOY_ENVIRONMENT: ${{ inputs.environment }}
+          CALLER_SHA: ${{ github.sha }}
+          IMAGE_SUFFIX: ${{ inputs.image-name }}
+          TAGS: ${{ inputs.tags }}
+          MOVING_TAGS: ${{ inputs.moving-tags }}
+          PLATFORMS: ${{ inputs.platforms }}
+          BUILD_ARGS: ${{ inputs.build-args }}
+        run: |
+          set -euo pipefail
+          python3 -I - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+
+          def lines(name):
+              return [line for line in os.environ[name].splitlines() if line]
+
+          environment = os.environ["DEPLOY_ENVIRONMENT"]
+          if not re.fullmatch(r"[a-z][a-z0-9-]{0,62}", environment):
+              raise SystemExit("environment must be a lowercase environment name")
+          if not re.fullmatch(r"[0-9a-f]{40}", os.environ["CALLER_SHA"]):
+              raise SystemExit("Caller SHA must be a full commit SHA")
+          suffix = os.environ["IMAGE_SUFFIX"]
+          if suffix and not re.fullmatch(r"[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*", suffix):
+              raise SystemExit("image-name is invalid")
+          tags, moving = lines("TAGS"), lines("MOVING_TAGS")
+          for values in (tags, moving):
+              if len(values) != len(set(values)):
+                  raise SystemExit("Duplicate tags are not allowed")
+              if any(not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,127}", tag) for tag in values):
+                  raise SystemExit("Invalid explicit tag")
+          if os.environ["TAGS"] and not tags:
+              raise SystemExit("tags must contain at least one tag when non-empty")
+          if not set(moving).issubset(tags):
+              raise SystemExit("moving-tags must be a subset of tags")
+          platforms = lines("PLATFORMS")
+          runners = {"linux/amd64": "ubuntu-24.04", "linux/arm64": "ubuntu-24.04-arm"}
+          if (os.environ["PLATFORMS"] and not platforms) or len(platforms) != len(set(platforms)):
+              raise SystemExit("platforms must contain distinct supported platforms")
+          if any(platform not in runners for platform in platforms):
+              raise SystemExit("Supported platforms are linux/amd64 and linux/arm64")
+          for line in lines("BUILD_ARGS"):
+              key, separator, value = line.partition("=")
+              if not separator or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) or "\0" in value:
+                  raise SystemExit("build-args must contain literal KEY=VALUE pairs with identifier keys")
+          # A public image suffix distinguishes multiple calls in the same run.
+          prefix = f"oci-{environment}-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}"
+          if suffix:
+              prefix += "-" + hashlib.sha256(suffix.encode()).hexdigest()
+          matrix = {"include": [{"platform": platform,
+                                 "runner": runners.get(platform, "ubuntu-24.04"),
+                                 "artifact": prefix + ("-" + platform.replace("/", "-") if platform else "")}
+                                for platform in platforms or [""]]}
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              for key, value in {"matrix": matrix, "platforms": platforms,
+                                 "tags": tags, "moving-tags": moving}.items():
+                  print(f"{key}={json.dumps(value, separators=(',', ':'))}", file=output)
+              print(f"artifact-prefix={prefix}", file=output)
+          PY
+
+  build:
+    needs: prepare
+    # Forks skip instead of failing at authentication.
+    if: contains(fromJSON('["Blockstream", "BlockstreamResearch"]'), github.repository_owner)
+    strategy:
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
     # Large static-site pre-renders take ~50 minutes on a 2-vCPU runner.
     timeout-minutes: 90
     environment: ${{ inputs.build-environment || format('{0}-build', inputs.environment) }}
@@ -91,26 +203,6 @@ jobs:
     outputs:
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
     steps:
-      # Fail before a long build; publish checks these again.
-      - name: Validate inputs
-        env:
-          DEPLOY_ENVIRONMENT: ${{ inputs.environment }}
-          CALLER_SHA: ${{ github.sha }}
-          PROVIDER: ${{ inputs.workload-identity-provider }}
-          SERVICE_ACCOUNT: ${{ inputs.service-account }}
-          IMAGE_NAME: ${{ inputs.image }}
-        run: |
-          set -euo pipefail
-          [[ "$DEPLOY_ENVIRONMENT" =~ ^[a-z][a-z0-9-]{0,62}$ ]] \
-            || { echo 'environment must be a lowercase environment name' >&2; exit 1; }
-          [[ "$CALLER_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
-          [[ "$PROVIDER" =~ ^projects/[0-9]+/locations/global/workloadIdentityPools/[a-z0-9-]+/providers/[a-z0-9-]+$ ]] \
-            || { echo 'workload-identity-provider is invalid' >&2; exit 1; }
-          [[ "$SERVICE_ACCOUNT" =~ ^[a-z0-9-]+@[a-z0-9-]+\.iam\.gserviceaccount\.com$ ]] \
-            || { echo 'service-account is invalid' >&2; exit 1; }
-          [[ "$IMAGE_NAME" =~ ^[a-z0-9-]+-docker\.pkg\.dev/[a-z0-9-]+/[a-z0-9-]+/[a-z0-9-]+$ ]] \
-            || { echo 'image is invalid' >&2; exit 1; }
-
       - name: Check out caller at the triggering commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -125,6 +217,8 @@ jobs:
           BUILD_CONTEXT: ${{ inputs.context }}
           DOCKERFILE: ${{ inputs.dockerfile }}
           BUILD_TARGET: ${{ inputs.target }}
+          BUILD_PLATFORM: ${{ matrix.platform }}
+          BUILD_ARGS: ${{ inputs.build-args }}
           BUILD_ARG_VARS: ${{ inputs.build-arg-vars }}
           BUILD_ARG_SECRETS: ${{ inputs.build-arg-secrets }}
           BUILD_SECRETS: ${{ inputs.build-secrets }}
@@ -132,8 +226,10 @@ jobs:
           # release names; build contexts usually exclude .git.
           SOURCE_COMMIT: ${{ github.sha }}
           VARS_JSON: ${{ toJSON(vars) }}
-          # Callers name the secrets they need; confined to build, with no OIDC.
-          SECRETS_JSON: ${{ toJSON(secrets) }} # zizmor: ignore[overprovisioned-secrets]
+          # Expressions cannot project arbitrary named secrets. Keep publisher
+          # settings out of this environment, including when secrets are inherited.
+          PUBLISHER_SECRETS_PRESENT: ${{ secrets.workload-identity-provider != '' || secrets.service-account != '' || secrets.image != '' }}
+          SECRETS_JSON: ${{ (inputs.build-secrets != '' || inputs.build-arg-secrets != '') && secrets.workload-identity-provider == '' && secrets.service-account == '' && secrets.image == '' && toJSON(secrets) || '{}' }} # zizmor: ignore[overprovisioned-secrets]
         run: |
           set -euo pipefail
           python3 -I - <<'PY'
@@ -142,6 +238,11 @@ jobs:
           from pathlib import Path
           import re
           import subprocess
+
+          if os.environ["PUBLISHER_SECRETS_PRESENT"] == "true" and (
+              os.environ["BUILD_SECRETS"].strip() or os.environ["BUILD_ARG_SECRETS"].strip()
+          ):
+              raise SystemExit("Publisher secrets cannot be combined with build-secrets or build-arg-secrets")
 
           workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
           context = (workspace / os.environ["BUILD_CONTEXT"]).resolve()
@@ -154,6 +255,10 @@ jobs:
           archive = Path(os.environ["RUNNER_TEMP"]) / "build-image.oci.tar"
           args = ["docker", "buildx", "build", "--file", str(dockerfile),
                   "--output", f"type=oci,dest={archive}", "--provenance=false"]
+          if os.environ["BUILD_PLATFORM"]:
+              if os.environ["BUILD_PLATFORM"] not in ("linux/amd64", "linux/arm64"):
+                  raise SystemExit("Unsupported build platform")
+              args += ["--platform", os.environ["BUILD_PLATFORM"]]
           if os.environ["BUILD_TARGET"]:
               args += ["--target", os.environ["BUILD_TARGET"]]
           if not re.fullmatch(r"[0-9a-f]{40}", os.environ["SOURCE_COMMIT"]):
@@ -166,7 +271,17 @@ jobs:
           build_env = dict(os.environ)
           build_env.pop("VARS_JSON", None)
           build_env.pop("SECRETS_JSON", None)
-          seen = set()
+          seen = {"SOURCE_COMMIT"}
+          for line in os.environ["BUILD_ARGS"].splitlines():
+              if not line:
+                  continue
+              name, separator, value = line.partition("=")
+              if not separator or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) or "\0" in value:
+                  raise SystemExit("Invalid literal build argument")
+              if name in seen:
+                  raise SystemExit("Duplicate or reserved build argument name")
+              seen.add(name)
+              args += ["--build-arg", line]
           for names_key, values_key in [("BUILD_ARG_VARS", "VARS_JSON"),
                                        ("BUILD_ARG_SECRETS", "SECRETS_JSON"),
                                        ("BUILD_SECRETS", "SECRETS_JSON")]:
@@ -200,15 +315,14 @@ jobs:
         id: upload
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          # One image per environment per workflow run.
-          name: oci-${{ inputs.environment }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ${{ matrix.artifact }}
           path: ${{ runner.temp }}/build-image.oci.tar
           if-no-files-found: error
           retention-days: 1
           compression-level: 0
 
   publish:
-    needs: build
+    needs: [prepare, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     environment: ${{ inputs.environment }}
@@ -221,84 +335,197 @@ jobs:
     # No checkout, local actions, caller scripts, docker load or container runs
     # in this job. The only caller-produced input is the OCI data artifact.
     steps:
-      - name: Validate settings and derive the tag
+      - name: Validate publisher settings and resolve the destination
         id: destination
         env:
           BUILD_ARTIFACT_ID: ${{ needs.build.outputs.artifact-id }}
+          PLATFORMS_JSON: ${{ needs.prepare.outputs.platforms }}
           CALLER_SHA: ${{ github.sha }}
           DEPLOY_ENVIRONMENT: ${{ inputs.environment }}
-          PROVIDER: ${{ inputs.workload-identity-provider }}
-          SERVICE_ACCOUNT: ${{ inputs.service-account }}
-          IMAGE_NAME: ${{ inputs.image }}
+          PROVIDER: ${{ inputs.workload-identity-provider || secrets.workload-identity-provider }}
+          SERVICE_ACCOUNT: ${{ inputs.service-account || secrets.service-account }}
+          IMAGE_NAME: ${{ inputs.image || secrets.image }}
+          IMAGE_FROM_SECRET: ${{ inputs.image == '' }}
+          IMAGE_SUFFIX: ${{ inputs.image-name }}
+          TAGS_JSON: ${{ needs.prepare.outputs.tags }}
+          MOVING_TAGS_JSON: ${{ needs.prepare.outputs.moving-tags }}
         run: |
           set -euo pipefail
-          [[ "$BUILD_ARTIFACT_ID" =~ ^[0-9]+$ ]] || exit 1
-          [[ "$CALLER_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
-          [[ "$PROVIDER" =~ ^projects/[0-9]+/locations/global/workloadIdentityPools/[a-z0-9-]+/providers/[a-z0-9-]+$ ]] \
-            || { echo 'workload-identity-provider is invalid' >&2; exit 1; }
-          [[ "$SERVICE_ACCOUNT" =~ ^[a-z0-9-]+@[a-z0-9-]+\.iam\.gserviceaccount\.com$ ]] \
-            || { echo 'service-account is invalid' >&2; exit 1; }
-          [[ "$IMAGE_NAME" =~ ^([a-z0-9-]+)-docker\.pkg\.dev/[a-z0-9-]+/[a-z0-9-]+/[a-z0-9-]+$ ]] \
-            || { echo 'image is invalid' >&2; exit 1; }
-          printf 'registry=%s-docker.pkg.dev\n' "${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
-          tag="$CALLER_SHA-$(date -u +%Y%m%d%H%M%S)"
-          if [[ "$DEPLOY_ENVIRONMENT" == production ]]; then
-            tag="prod-$tag"
-          fi
-          printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
+          python3 -I - <<'PY'
+          from datetime import datetime, timezone
+          import json
+          import os
+          from pathlib import Path
+          import re
+
+          if not json.loads(os.environ["PLATFORMS_JSON"]) and not re.fullmatch(r"[0-9]+", os.environ["BUILD_ARTIFACT_ID"]):
+              raise SystemExit("Missing or invalid build artifact ID")
+          if not re.fullmatch(r"[0-9a-f]{40}", os.environ["CALLER_SHA"]):
+              raise SystemExit("Caller SHA must be a full commit SHA")
+          for key, label in [("PROVIDER", "workload-identity-provider"),
+                             ("SERVICE_ACCOUNT", "service-account"), ("IMAGE_NAME", "image")]:
+              if not os.environ[key]:
+                  raise SystemExit(f"{label} requires a non-empty input or secret")
+          if not re.fullmatch(r"projects/[0-9]+/locations/global/workloadIdentityPools/[a-z0-9-]+/providers/[a-z0-9-]+", os.environ["PROVIDER"]):
+              raise SystemExit("workload-identity-provider is invalid")
+          if not re.fullmatch(r"[a-z0-9-]+@[a-z0-9-]+\.iam\.gserviceaccount\.com", os.environ["SERVICE_ACCOUNT"]):
+              raise SystemExit("service-account is invalid")
+          image = os.environ["IMAGE_NAME"]
+          suffix = os.environ["IMAGE_SUFFIX"]
+          if suffix:
+              if not re.fullmatch(r"[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*", suffix):
+                  raise SystemExit("image-name is invalid")
+              pattern = r"[a-z0-9-]+-docker\.pkg\.dev/[a-z0-9-]+/[a-z0-9-]+(/[a-z0-9]+([._-][a-z0-9]+)*)*"
+          else:
+              pattern = r"[a-z0-9-]+-docker\.pkg\.dev/[a-z0-9-]+/[a-z0-9-]+/[a-z0-9-]+"
+          if not re.fullmatch(pattern, image):
+              raise SystemExit("image is invalid")
+          registry = image.split("/", 1)[0]
+          if suffix:
+              image += "/" + suffix
+          if os.environ["IMAGE_FROM_SECRET"] == "true":
+              # Mask derived strings too; the registry alone is only part of the secret.
+              print(f"::add-mask::{registry}")
+              print(f"::add-mask::{image}")
+          tags = json.loads(os.environ["TAGS_JSON"])
+          explicit = bool(tags)
+          if not explicit:
+              tag = os.environ["CALLER_SHA"] + "-" + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+              if os.environ["DEPLOY_ENVIRONMENT"] == "production":
+                  tag = "prod-" + tag
+              tags = [tag]
+          settings = {"image": image, "tags": tags, "explicit": explicit,
+                      "moving": json.loads(os.environ["MOVING_TAGS_JSON"])}
+          path = Path(os.environ["RUNNER_TEMP"]) / "publish-settings.json"
+          with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as output:
+              json.dump(settings, output)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              print(f"registry={registry}", file=output)
+          PY
 
       - name: Download only this build's artifact
+        if: needs.prepare.outputs.platforms == '[]'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ needs.build.outputs.artifact-id }}
           path: ${{ runner.temp }}/incoming-image
           merge-multiple: true
 
-      - name: Unpack OCI data without executing caller content
+      - name: Download the amd64 artifact
+        if: contains(fromJSON(needs.prepare.outputs.platforms), 'linux/amd64')
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ needs.prepare.outputs.artifact-prefix }}-linux-amd64
+          path: ${{ runner.temp }}/incoming-image/linux-amd64
+
+      - name: Download the arm64 artifact
+        if: contains(fromJSON(needs.prepare.outputs.platforms), 'linux/arm64')
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ needs.prepare.outputs.artifact-prefix }}-linux-arm64
+          path: ${{ runner.temp }}/incoming-image/linux-arm64
+
+      - name: Unpack and merge OCI data without executing caller content
+        env:
+          PLATFORMS_JSON: ${{ needs.prepare.outputs.platforms }}
         run: |
           set -euo pipefail
           python3 -I - <<'PY'
           import hashlib
+          import json
           import os
           from pathlib import Path
           import re
           import tarfile
 
-          archive = Path(os.environ["RUNNER_TEMP"]) / "incoming-image/build-image.oci.tar"
-          root = Path(os.environ["RUNNER_TEMP"]) / "publish-oci"
-          root.mkdir(mode=0o700)
-          total = 0
-          entries = 0
-          # crane expects an OCI directory, not an OCI tarball. Copy only the
-          # OCI layout's data files; never extract links, paths or file modes.
-          with tarfile.open(archive, mode="r|") as source:
-              for member in source:
-                  entries += 1
-                  if entries > 100000:
-                      raise SystemExit("Too many OCI entries")
-                  name = member.name.removeprefix("./")
-                  if member.isdir() and name.rstrip("/") in (".", "blobs", "blobs/sha256"):
-                      continue
-                  is_blob = re.fullmatch(r"blobs/sha256/[0-9a-f]{64}", name)
-                  if not member.isfile() or (name not in ("index.json", "oci-layout") and not is_blob):
-                      raise SystemExit("Unexpected OCI entry")
-                  total += member.size
-                  if member.size < 0 or total > 10 * 1024**3:
-                      raise SystemExit("OCI archive exceeds 10 GiB limit")
-                  target = root / name
-                  target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-                  digest = hashlib.sha256()
-                  # Exclusive creation rejects duplicate entries. No supplied
-                  # entry can create a symlink or escape this isolated directory.
-                  with source.extractfile(member) as incoming, target.open("xb") as output:
-                      os.chmod(target, 0o600)
-                      while chunk := incoming.read(1024 * 1024):
-                          digest.update(chunk)
-                          output.write(chunk)
-                  if is_blob and digest.hexdigest() != target.name:
-                      raise SystemExit("OCI blob digest mismatch")
-          if not (root / "index.json").is_file() or not (root / "oci-layout").is_file():
-              raise SystemExit("Missing OCI layout metadata")
+          def unpack(archive, root):
+              root.mkdir(mode=0o700)
+              total = 0
+              entries = 0
+              # crane expects an OCI directory, not an OCI tarball. Copy only the
+              # OCI layout's data files; never extract links, paths or file modes.
+              with tarfile.open(archive, mode="r|") as source:
+                  for member in source:
+                      entries += 1
+                      if entries > 100000:
+                          raise SystemExit("Too many OCI entries")
+                      name = member.name.removeprefix("./")
+                      if member.isdir() and name.rstrip("/") in (".", "blobs", "blobs/sha256"):
+                          continue
+                      is_blob = re.fullmatch(r"blobs/sha256/[0-9a-f]{64}", name)
+                      if not member.isfile() or (name not in ("index.json", "oci-layout") and not is_blob):
+                          raise SystemExit("Unexpected OCI entry")
+                      total += member.size
+                      if member.size < 0 or total > 10 * 1024**3:
+                          raise SystemExit("OCI archive exceeds 10 GiB limit")
+                      target = root / name
+                      target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                      digest = hashlib.sha256()
+                      # Exclusive creation rejects duplicate entries. No supplied
+                      # entry can create a symlink or escape this isolated directory.
+                      with source.extractfile(member) as incoming, target.open("xb") as output:
+                          os.chmod(target, 0o600)
+                          while chunk := incoming.read(1024 * 1024):
+                              digest.update(chunk)
+                              output.write(chunk)
+                      if is_blob and digest.hexdigest() != target.name:
+                          raise SystemExit("OCI blob digest mismatch")
+              if not (root / "index.json").is_file() or not (root / "oci-layout").is_file():
+                  raise SystemExit("Missing OCI layout metadata")
+
+          def read_descriptor(root, descriptor):
+              digest = descriptor.get("digest", "")
+              if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest) or descriptor.get("urls"):
+                  raise SystemExit("Invalid OCI descriptor")
+              blob = root / "blobs/sha256" / digest.split(":")[1]
+              data = blob.read_bytes()
+              if len(data) != descriptor.get("size"):
+                  raise SystemExit("OCI descriptor size mismatch")
+              return json.loads(data)
+
+          temp = Path(os.environ["RUNNER_TEMP"])
+          root = temp / "publish-oci"
+          platforms = json.loads(os.environ["PLATFORMS_JSON"])
+          if not platforms:
+              unpack(temp / "incoming-image/build-image.oci.tar", root)
+          else:
+              root.mkdir(mode=0o700)
+              blobs = root / "blobs/sha256"
+              blobs.mkdir(mode=0o700, parents=True)
+              manifests = []
+              for platform in platforms:
+                  if platform not in ("linux/amd64", "linux/arm64"):
+                      raise SystemExit("Unsupported OCI platform")
+                  name = platform.replace("/", "-")
+                  source = temp / ("unpacked-" + name)
+                  unpack(temp / "incoming-image" / name / "build-image.oci.tar", source)
+                  if json.loads((source / "oci-layout").read_bytes()) != {"imageLayoutVersion": "1.0.0"}:
+                      raise SystemExit("Unsupported OCI layout version")
+                  index = json.loads((source / "index.json").read_bytes())
+                  if index.get("schemaVersion") != 2 or len(index.get("manifests", [])) != 1:
+                      raise SystemExit("Each platform archive must contain exactly one image manifest")
+                  descriptor = index["manifests"][0]
+                  if descriptor.get("mediaType") not in ("application/vnd.oci.image.manifest.v1+json",
+                                                        "application/vnd.docker.distribution.manifest.v2+json"):
+                      raise SystemExit("Expected a platform image manifest")
+                  manifest = read_descriptor(source, descriptor)
+                  config = read_descriptor(source, manifest["config"])
+                  operating_system, architecture = platform.split("/")
+                  if config.get("os") != operating_system or config.get("architecture") != architecture:
+                      raise SystemExit("OCI image does not match the requested platform")
+                  manifests.append({"mediaType": descriptor["mediaType"], "digest": descriptor["digest"],
+                                    "size": descriptor["size"],
+                                    "platform": {"os": operating_system, "architecture": architecture}})
+                  for blob in (source / "blobs/sha256").iterdir():
+                      destination = blobs / blob.name
+                      if not destination.exists():
+                          os.link(blob, destination)
+              (root / "oci-layout").write_text('{"imageLayoutVersion":"1.0.0"}')
+              # Sort platforms so input ordering cannot change the index digest.
+              manifests.sort(key=lambda item: (item["platform"]["os"], item["platform"]["architecture"]))
+              (root / "index.json").write_text(json.dumps({"schemaVersion": 2,
+                  "mediaType": "application/vnd.oci.image.index.v1+json", "manifests": manifests},
+                  separators=(",", ":")))
           PY
 
       - name: Install crane with a pinned archive checksum
@@ -322,8 +549,8 @@ jobs:
         id: auth
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
-          workload_identity_provider: ${{ inputs.workload-identity-provider }}
-          service_account: ${{ inputs.service-account }}
+          workload_identity_provider: ${{ inputs.workload-identity-provider || secrets.workload-identity-provider }}
+          service_account: ${{ inputs.service-account || secrets.service-account }}
           token_format: access_token
           create_credentials_file: false
           export_environment_variables: false
@@ -340,15 +567,88 @@ jobs:
       - name: Push image and record the registry digest
         id: push
         env:
-          IMAGE_NAME: ${{ inputs.image }}
-          IMAGE_TAG: ${{ steps.destination.outputs.tag }}
+          PLATFORMS_JSON: ${{ needs.prepare.outputs.platforms }}
         run: |
           set -euo pipefail
-          crane push "$RUNNER_TEMP/publish-oci" "$IMAGE_NAME:$IMAGE_TAG"
-          digest="$(crane digest "$IMAGE_NAME:$IMAGE_TAG")"
-          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || exit 1
-          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
-          printf 'image=%s@%s\n' "$IMAGE_NAME" "$digest" >> "$GITHUB_OUTPUT"
+          python3 -I - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+
+          temp = Path(os.environ["RUNNER_TEMP"])
+          root = temp / "publish-oci"
+          settings = json.loads((temp / "publish-settings.json").read_text())
+          image, tags = settings["image"], settings["tags"]
+          platforms = json.loads(os.environ["PLATFORMS_JSON"])
+          index_data = (root / "index.json").read_bytes()
+          if platforms:
+              digest = "sha256:" + hashlib.sha256(index_data).hexdigest()
+          else:
+              manifests = json.loads(index_data)["manifests"]
+              if len(manifests) != 1:
+                  raise SystemExit("Expected exactly one image in the default OCI layout")
+              digest = manifests[0]["digest"]
+          if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+              raise SystemExit("Invalid local image digest")
+
+          def crane(*args):
+              # Never include registry names or credentials in exception messages.
+              return subprocess.run(["crane", *args], capture_output=True, text=True, check=False)
+
+          def existing_digest(tag):
+              result = crane("digest", f"{image}:{tag}")
+              if result.returncode == 0:
+                  value = result.stdout.strip()
+                  if not re.fullmatch(r"sha256:[0-9a-f]{64}", value):
+                      raise SystemExit("Invalid registry digest")
+                  return value
+              # HEAD errors may omit the registry error code; GET obtains the body.
+              result = crane("manifest", f"{image}:{tag}")
+              if result.returncode == 0:
+                  raise SystemExit("Registry digest lookup failed; retry before publishing")
+              error = result.stderr.strip().splitlines()[-1:] or [""]
+              error = error[0]
+              codes = re.findall(r"\b([A-Z][A-Z_]+):", error)
+              absent = bool(codes) and set(codes) <= {"MANIFEST_UNKNOWN", "NAME_UNKNOWN"}
+              # Accept an explicit HTTP 404, never a generic transport or auth error.
+              absent = absent or (not codes and bool(re.search(r"unexpected status code:? 404 Not Found\b", error)))
+              if not absent:
+                  raise SystemExit(f"Cannot check tag {tag}: registry lookup failed (not confirmed absent)")
+              return None
+
+          pending = tags
+          if settings["explicit"]:
+              pending = []
+              # Check every tag before making any registry mutation.
+              for tag in tags:
+                  current = existing_digest(tag)
+                  if current == digest:
+                      continue
+                  if current is not None and tag not in settings["moving"]:
+                      raise SystemExit(f"Immutable tag {tag} already points to a different digest")
+                  pending.append(tag)
+          if pending:
+              first, *remaining = pending
+              args = ["push"] + (["--index"] if platforms else [])
+              result = crane(*args, str(root), f"{image}:{first}")
+              if result.returncode:
+                  raise SystemExit("Image push failed")
+              result = crane("digest", f"{image}:{first}")
+              if result.returncode or result.stdout.strip() != digest:
+                  raise SystemExit("Published digest does not match the local OCI digest")
+              for tag in remaining:
+                  if crane("tag", f"{image}@{digest}", tag).returncode:
+                      raise SystemExit(f"Failed to publish tag {tag}")
+              print(f"Published {len(pending)} tag(s)")
+          else:
+              print("All tags already point to this digest; no push or tag changes")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              print(f"digest={digest}", file=output)
+              print(f"image={image}@{digest}", file=output)
+          PY
 
       - name: Sign image by digest using GitHub OIDC
         env:
