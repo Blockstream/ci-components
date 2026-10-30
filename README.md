@@ -40,7 +40,9 @@ Three stages:
 
 The tag is `<commit>-<UTC yyyymmddHHMMSS>`, prefixed `prod-` when
 `environment` is `production`. Non-empty `tags` replaces that derived tag
-entirely, including the production prefix.
+entirely, including the production prefix. Explicit tags must not start with
+`prod-` (in any case) or have the derived `<hex>-<number>` form: every
+environment can pass `tags`, so only derived tags may look like derived tags.
 
 ### Caller
 
@@ -241,3 +243,6 @@ cosign verify \
 
 Always check `--certificate-github-workflow-repository`: this workflow is
 public, so the identity alone does not say which repository built the image.
+A tag does not prove which branch built an image. To accept only images built
+from one ref, also check it, for example
+`--certificate-github-workflow-ref refs/heads/main`.

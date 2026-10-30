@@ -4,6 +4,9 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # Let a new action release age before it reaches the workflow that signs images.
+    cooldown:
+      default-days: 7
     groups:
       actions:
         patterns: ["*"]

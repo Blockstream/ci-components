@@ -120,7 +120,6 @@ jobs:
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
       platforms: ${{ steps.plan.outputs.platforms }}
-      artifact-prefix: ${{ steps.plan.outputs.artifact-prefix }}
       tags: ${{ steps.plan.outputs.tags }}
       moving-tags: ${{ steps.plan.outputs.moving-tags }}
     steps:
@@ -161,6 +160,10 @@ jobs:
                   raise SystemExit("Invalid explicit tag")
           if os.environ["TAGS"] and not tags:
               raise SystemExit("tags must contain at least one tag when non-empty")
+          # Derived tags carry the environment (prod- only from production). Any
+          # environment may pass explicit tags, so they must not look derived.
+          if any(re.fullmatch(r"(?i)prod-.*|[0-9a-f]+-[0-9]+", tag) for tag in tags):
+              raise SystemExit("Explicit tags must not use the prod- prefix or the derived <hex>-<number> form")
           if not set(moving).issubset(tags):
               raise SystemExit("moving-tags must be a subset of tags")
           platforms = lines("PLATFORMS")
@@ -185,12 +188,11 @@ jobs:
               for key, value in {"matrix": matrix, "platforms": platforms,
                                  "tags": tags, "moving-tags": moving}.items():
                   print(f"{key}={json.dumps(value, separators=(',', ':'))}", file=output)
-              print(f"artifact-prefix={prefix}", file=output)
           PY
 
   build:
     needs: prepare
-    # Forks skip instead of failing at authentication.
+    # Forked repositories skip instead of failing at authentication.
     if: contains(fromJSON('["Blockstream", "BlockstreamResearch"]'), github.repository_owner)
     strategy:
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
@@ -200,8 +202,12 @@ jobs:
     environment: ${{ inputs.build-environment || format('{0}-build', inputs.environment) }}
     permissions:
       contents: read
+    # One output per matrix leg; a leg leaves the other outputs empty. publish
+    # downloads by ID, because any job in the run can replace a named artifact.
     outputs:
-      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      artifact-id: ${{ steps.artifact.outputs.default }}
+      artifact-id-amd64: ${{ steps.artifact.outputs.linux-amd64 }}
+      artifact-id-arm64: ${{ steps.artifact.outputs.linux-arm64 }}
     steps:
       - name: Check out caller at the triggering commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -211,6 +217,9 @@ jobs:
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          # BuildKit produces the image that publish signs; do not follow a moving tag.
+          driver-opts: image=moby/buildkit:v0.34.1@sha256:99368f3e46177c6405b9740e4461d91cee004128daeecca78d4ceac50ec1da5c
 
       - name: Build OCI archive
         env:
@@ -321,6 +330,18 @@ jobs:
           retention-days: 1
           compression-level: 0
 
+      - name: Record the artifact ID for this platform
+        id: artifact
+        env:
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+          BUILD_PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          [[ "$ARTIFACT_ID" =~ ^[0-9]+$ ]] || { echo 'Invalid artifact ID' >&2; exit 1; }
+          key=default
+          [[ -z "$BUILD_PLATFORM" ]] || key="${BUILD_PLATFORM//\//-}"
+          echo "$key=$ARTIFACT_ID" >> "$GITHUB_OUTPUT"
+
   publish:
     needs: [prepare, build]
     runs-on: ubuntu-24.04
@@ -339,6 +360,8 @@ jobs:
         id: destination
         env:
           BUILD_ARTIFACT_ID: ${{ needs.build.outputs.artifact-id }}
+          AMD64_ARTIFACT_ID: ${{ needs.build.outputs.artifact-id-amd64 }}
+          ARM64_ARTIFACT_ID: ${{ needs.build.outputs.artifact-id-arm64 }}
           PLATFORMS_JSON: ${{ needs.prepare.outputs.platforms }}
           CALLER_SHA: ${{ github.sha }}
           DEPLOY_ENVIRONMENT: ${{ inputs.environment }}
@@ -358,8 +381,11 @@ jobs:
           from pathlib import Path
           import re
 
-          if not json.loads(os.environ["PLATFORMS_JSON"]) and not re.fullmatch(r"[0-9]+", os.environ["BUILD_ARTIFACT_ID"]):
-              raise SystemExit("Missing or invalid build artifact ID")
+          platforms = json.loads(os.environ["PLATFORMS_JSON"])
+          artifact_ids = {"linux/amd64": "AMD64_ARTIFACT_ID", "linux/arm64": "ARM64_ARTIFACT_ID"}
+          for key in [artifact_ids[platform] for platform in platforms] or ["BUILD_ARTIFACT_ID"]:
+              if not re.fullmatch(r"[0-9]+", os.environ[key]):
+                  raise SystemExit("Missing or invalid build artifact ID")
           if not re.fullmatch(r"[0-9a-f]{40}", os.environ["CALLER_SHA"]):
               raise SystemExit("Caller SHA must be a full commit SHA")
           for key, label in [("PROVIDER", "workload-identity-provider"),
@@ -415,15 +441,17 @@ jobs:
         if: contains(fromJSON(needs.prepare.outputs.platforms), 'linux/amd64')
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: ${{ needs.prepare.outputs.artifact-prefix }}-linux-amd64
+          artifact-ids: ${{ needs.build.outputs.artifact-id-amd64 }}
           path: ${{ runner.temp }}/incoming-image/linux-amd64
+          merge-multiple: true
 
       - name: Download the arm64 artifact
         if: contains(fromJSON(needs.prepare.outputs.platforms), 'linux/arm64')
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: ${{ needs.prepare.outputs.artifact-prefix }}-linux-arm64
+          artifact-ids: ${{ needs.build.outputs.artifact-id-arm64 }}
           path: ${{ runner.temp }}/incoming-image/linux-arm64
+          merge-multiple: true
 
       - name: Unpack and merge OCI data without executing caller content
         env:
@@ -458,6 +486,8 @@ jobs:
                       total += member.size
                       if member.size < 0 or total > 10 * 1024**3:
                           raise SystemExit("OCI archive exceeds 10 GiB limit")
+                      if not is_blob and member.size > 1024**2:
+                          raise SystemExit("OCI layout metadata is too large")
                       target = root / name
                       target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
                       digest = hashlib.sha256()
@@ -473,21 +503,51 @@ jobs:
               if not (root / "index.json").is_file() or not (root / "oci-layout").is_file():
                   raise SystemExit("Missing OCI layout metadata")
 
-          def read_descriptor(root, descriptor):
+          def local_blob(root, descriptor):
+              # Blob names were checked against their content during unpack.
               digest = descriptor.get("digest", "")
+              size = descriptor.get("size")
               if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest) or descriptor.get("urls"):
                   raise SystemExit("Invalid OCI descriptor")
               blob = root / "blobs/sha256" / digest.split(":")[1]
-              data = blob.read_bytes()
-              if len(data) != descriptor.get("size"):
-                  raise SystemExit("OCI descriptor size mismatch")
-              return json.loads(data)
+              if not isinstance(size, int) or not blob.is_file() or blob.stat().st_size != size:
+                  raise SystemExit("OCI blob is missing or has the wrong size")
+              return blob
+
+          def read_descriptor(root, descriptor):
+              # Manifests and configs are small JSON; never read a layer into memory.
+              blob = local_blob(root, descriptor)
+              if descriptor["size"] > 4 * 1024**2:
+                  raise SystemExit("OCI manifest or config is too large")
+              return json.loads(blob.read_bytes())
+
+          def single_image(root):
+              # Every blob the image references must be in this artifact. Otherwise
+              # publish could sign a digest that only exists in the registry.
+              if json.loads((root / "oci-layout").read_bytes()) != {"imageLayoutVersion": "1.0.0"}:
+                  raise SystemExit("Unsupported OCI layout version")
+              index = json.loads((root / "index.json").read_bytes())
+              if index.get("schemaVersion") != 2 or len(index.get("manifests", [])) != 1:
+                  raise SystemExit("Each OCI archive must contain exactly one image manifest")
+              descriptor = index["manifests"][0]
+              if descriptor.get("mediaType") not in ("application/vnd.oci.image.manifest.v1+json",
+                                                    "application/vnd.docker.distribution.manifest.v2+json"):
+                  raise SystemExit("Expected an image manifest")
+              manifest = read_descriptor(root, descriptor)
+              config = read_descriptor(root, manifest.get("config", {}))
+              layers = manifest.get("layers")
+              if not isinstance(layers, list):
+                  raise SystemExit("Invalid image manifest")
+              for layer in layers:
+                  local_blob(root, layer)
+              return descriptor, config
 
           temp = Path(os.environ["RUNNER_TEMP"])
           root = temp / "publish-oci"
           platforms = json.loads(os.environ["PLATFORMS_JSON"])
           if not platforms:
               unpack(temp / "incoming-image/build-image.oci.tar", root)
+              single_image(root)
           else:
               root.mkdir(mode=0o700)
               blobs = root / "blobs/sha256"
@@ -499,17 +559,7 @@ jobs:
                   name = platform.replace("/", "-")
                   source = temp / ("unpacked-" + name)
                   unpack(temp / "incoming-image" / name / "build-image.oci.tar", source)
-                  if json.loads((source / "oci-layout").read_bytes()) != {"imageLayoutVersion": "1.0.0"}:
-                      raise SystemExit("Unsupported OCI layout version")
-                  index = json.loads((source / "index.json").read_bytes())
-                  if index.get("schemaVersion") != 2 or len(index.get("manifests", [])) != 1:
-                      raise SystemExit("Each platform archive must contain exactly one image manifest")
-                  descriptor = index["manifests"][0]
-                  if descriptor.get("mediaType") not in ("application/vnd.oci.image.manifest.v1+json",
-                                                        "application/vnd.docker.distribution.manifest.v2+json"):
-                      raise SystemExit("Expected a platform image manifest")
-                  manifest = read_descriptor(source, descriptor)
-                  config = read_descriptor(source, manifest["config"])
+                  descriptor, config = single_image(source)
                   operating_system, architecture = platform.split("/")
                   if config.get("os") != operating_system or config.get("architecture") != architecture:
                       raise SystemExit("OCI image does not match the requested platform")
@@ -529,16 +579,21 @@ jobs:
           PY
 
       - name: Install crane with a pinned archive checksum
-        # This maintained release installer verifies the digest, and does not
-        # perform the unrelated GHCR login in imjasonh/setup-crane.
-        uses: jaxxstorm/action-install-gh-release@25e24d2d23ae098373794ef1d6faecb48ee52da8 # v3.0.0
-        with:
-          repo: google/go-containerregistry
-          tag: v0.22.1
-          platform: linux
-          arch: x86_64
-          digest: 0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0
-          cache: disable
+        # A plain download keeps third-party action code out of the job that
+        # holds the OIDC token. The checksum pins the release archive.
+        env:
+          CRANE_VERSION: v0.22.1
+          CRANE_SHA256: 0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/crane.tar.gz"
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$archive" \
+            "https://github.com/google/go-containerregistry/releases/download/$CRANE_VERSION/go-containerregistry_Linux_x86_64.tar.gz"
+          echo "$CRANE_SHA256  $archive" | sha256sum --check --strict -
+          mkdir -m 700 "$RUNNER_TEMP/crane-bin"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/crane-bin" --no-same-owner --no-same-permissions crane
+          chmod 0755 "$RUNNER_TEMP/crane-bin/crane"
+          echo "$RUNNER_TEMP/crane-bin" >> "$GITHUB_PATH"
 
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
@@ -610,7 +665,8 @@ jobs:
               if result.returncode == 0:
                   raise SystemExit("Registry digest lookup failed; retry before publishing")
               error = result.stderr.strip().splitlines()[-1:] or [""]
-              error = error[0]
+              # Drop the reference, request URL and quoted text: all can contain the tag.
+              error = re.sub(r'https?://\S*|"[^"]*"', "", error[0].replace(f"{image}:{tag}", ""))
               codes = re.findall(r"\b([A-Z][A-Z_]+):", error)
               absent = bool(codes) and set(codes) <= {"MANIFEST_UNKNOWN", "NAME_UNKNOWN"}
               # Accept an explicit HTTP 404, never a generic transport or auth error.
