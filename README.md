@@ -86,7 +86,7 @@ jobs:
 | `platforms` | empty | Newline-separated `linux/amd64` and/or `linux/arm64`; empty preserves the original single build |
 | `build-args` | empty | Newline-separated literal `KEY=VALUE` pairs; public values only |
 | `environment` | (required) | Environment of the publish job (deployment branch policy) |
-| `build-environment` | `<environment>-build` | Environment of the build job; holds build variables and secrets |
+| `build-environment` | `<environment>-build` | Environment of the build job; holds build variables and secrets. Must differ from `environment` |
 | `context` | `.` | Build context within the checkout |
 | `dockerfile` | `Dockerfile` | Dockerfile within the checkout |
 | `target` | | Dockerfile target |

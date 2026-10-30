@@ -127,6 +127,7 @@ jobs:
         id: plan
         env:
           DEPLOY_ENVIRONMENT: ${{ inputs.environment }}
+          BUILD_ENVIRONMENT: ${{ inputs.build-environment }}
           CALLER_SHA: ${{ github.sha }}
           IMAGE_SUFFIX: ${{ inputs.image-name }}
           TAGS: ${{ inputs.tags }}
@@ -147,6 +148,11 @@ jobs:
           environment = os.environ["DEPLOY_ENVIRONMENT"]
           if not re.fullmatch(r"[a-z][a-z0-9-]{0,62}", environment):
               raise SystemExit("environment must be a lowercase environment name")
+          # The build runs caller code; keep the publish environment's secrets out of it.
+          build_environment = os.environ["BUILD_ENVIRONMENT"]
+          if build_environment and (build_environment.lower() == environment
+                                    or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}", build_environment)):
+              raise SystemExit("build-environment must be a valid name other than environment")
           if not re.fullmatch(r"[0-9a-f]{40}", os.environ["CALLER_SHA"]):
               raise SystemExit("Caller SHA must be a full commit SHA")
           suffix = os.environ["IMAGE_SUFFIX"]
