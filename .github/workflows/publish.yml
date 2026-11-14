@@ -53,6 +53,14 @@ on:
         description: Newline-separated literal KEY=VALUE build arguments (public values only)
         type: string
         default: ''
+      static-assets-path:
+        description: Optional absolute directory inside the image to upload before publishing
+        type: string
+        default: ''
+      static-assets-destination:
+        description: Optional GCS destination, gs://example-static-bucket/_next/static (requires static-assets-path)
+        type: string
+        default: ''
       environment:
         description: Caller environment of the publish job. Derived tags get a prod- prefix for production.
         type: string
@@ -122,6 +130,8 @@ jobs:
       platforms: ${{ steps.plan.outputs.platforms }}
       tags: ${{ steps.plan.outputs.tags }}
       moving-tags: ${{ steps.plan.outputs.moving-tags }}
+      static-assets-path: ${{ steps.plan.outputs.static-assets-path }}
+      static-assets-destination: ${{ steps.plan.outputs.static-assets-destination }}
     steps:
       - name: Validate public inputs and select native runners
         id: plan
@@ -134,6 +144,8 @@ jobs:
           MOVING_TAGS: ${{ inputs.moving-tags }}
           PLATFORMS: ${{ inputs.platforms }}
           BUILD_ARGS: ${{ inputs.build-args }}
+          STATIC_ASSETS_PATH: ${{ inputs.static-assets-path }}
+          STATIC_ASSETS_DESTINATION: ${{ inputs.static-assets-destination }}
         run: |
           set -euo pipefail
           python3 -I - <<'PY'
@@ -182,6 +194,21 @@ jobs:
               key, separator, value = line.partition("=")
               if not separator or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) or "\0" in value:
                   raise SystemExit("build-args must contain literal KEY=VALUE pairs with identifier keys")
+          asset_path = os.environ["STATIC_ASSETS_PATH"]
+          asset_destination = os.environ["STATIC_ASSETS_DESTINATION"]
+          if bool(asset_path) != bool(asset_destination):
+              raise SystemExit("static-assets-path and static-assets-destination must be set together")
+          if asset_path:
+              if (not asset_path.startswith("/") or ".." in asset_path.split("/")
+                      or any(c in asset_path for c in "\0\r\n")):
+                  raise SystemExit("static-assets-path must be absolute without '..', NUL or newlines")
+              asset_path = "/" + "/".join(part for part in asset_path.split("/") if part not in ("", "."))
+              if (not re.fullmatch(r"gs://[a-z0-9][a-z0-9._-]{1,61}[a-z0-9](/[A-Za-z0-9._~/-]*)?", asset_destination)
+                      or ".." in asset_destination.removeprefix("gs://").split("/")):
+                  raise SystemExit("static-assets-destination must be a gs://BUCKET/PREFIX without '..' segments")
+              bucket, _, prefix = asset_destination.removeprefix("gs://").partition("/")
+              prefix = "/".join(part for part in prefix.split("/") if part not in ("", "."))
+              asset_destination = "gs://" + bucket + ("/" + prefix if prefix else "")
           # A public image suffix distinguishes multiple calls in the same run.
           prefix = f"oci-{environment}-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}"
           if suffix:
@@ -194,6 +221,8 @@ jobs:
               for key, value in {"matrix": matrix, "platforms": platforms,
                                  "tags": tags, "moving-tags": moving}.items():
                   print(f"{key}={json.dumps(value, separators=(',', ':'))}", file=output)
+              print(f"static-assets-path={asset_path}", file=output)
+              print(f"static-assets-destination={asset_destination}", file=output)
           PY
 
   build:
@@ -660,6 +689,350 @@ jobs:
           set -euo pipefail
           printf '%s' "$ACCESS_TOKEN" | crane auth login "$REGISTRY" \
             --username oauth2accesstoken --password-stdin
+
+      - name: Upload static assets before publishing the image
+        if: needs.prepare.outputs.static-assets-path != ''
+        timeout-minutes: 11
+        env:
+          STATIC_ASSETS_PATH: ${{ needs.prepare.outputs.static-assets-path }}
+          STATIC_ASSETS_DESTINATION: ${{ needs.prepare.outputs.static-assets-destination }}
+          ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
+          # Test override only; deliberately not a workflow input.
+          GCS_BASE_URL: https://storage.googleapis.com
+        run: |
+          set -euo pipefail
+          python3 -I - <<'PY'
+          import base64
+          from concurrent.futures import ThreadPoolExecutor
+          import gzip
+          import hashlib
+          import http.client
+          import io
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import signal
+          import tarfile
+          import tempfile
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          import uuid
+
+          MAX_FILE = 50 * 1024**2
+          MAX_TOTAL = 2 * 1024**3
+          MAX_FILES = 20000
+          MAX_ENTRIES = 200000
+          MAX_LAYER = 10 * 1024**3
+          TIMEOUT = 600
+          CACHE_CONTROL = "public, max-age=31536000, immutable"
+          CONTENT_TYPES = {
+              "js": "application/javascript", "mjs": "application/javascript",
+              "css": "text/css", "map": "application/json", "json": "application/json",
+              "svg": "image/svg+xml", "woff": "font/woff", "woff2": "font/woff2",
+              "ttf": "font/ttf", "otf": "font/otf", "png": "image/png",
+              "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif",
+              "webp": "image/webp", "avif": "image/avif", "ico": "image/x-icon",
+              "txt": "text/plain", "html": "text/html", "wasm": "application/wasm",
+          }
+          COMPRESS = {"js", "mjs", "css", "map", "json", "svg", "txt", "html", "wasm"}
+
+
+          def blob(root, descriptor):
+              # Unpack has already hashed every blob and validated all descriptors.
+              digest = descriptor["digest"]
+              if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+                  raise ValueError("Invalid static asset blob digest")
+              path = root / "blobs/sha256" / digest.split(":")[1]
+              if path.stat().st_size != descriptor["size"]:
+                  raise ValueError("Static asset blob size mismatch")
+              return path
+
+
+          def selected_layers(root):
+              manifests = json.loads((root / "index.json").read_bytes())["manifests"]
+              preferred = [item for item in manifests
+                           if item.get("platform", {}).get("os") == "linux"
+                           and item.get("platform", {}).get("architecture") == "amd64"]
+              if len(preferred) == 1:
+                  descriptor = preferred[0]
+              elif len(manifests) == 1:
+                  descriptor = manifests[0]
+              else:
+                  raise ValueError("Static assets require linux/amd64 or a single image")
+              return json.loads(blob(root, descriptor).read_bytes())["layers"]
+
+
+          class LimitedReader:
+              def __init__(self, source):
+                  self.source, self.total = source, 0
+
+              def read(self, size):
+                  data = self.source.read(size)
+                  self.total += len(data)
+                  if self.total > MAX_LAYER:
+                      raise ValueError("Expanded layer exceeds 10 GiB")
+                  return data
+
+
+          class AssetTarInfo(tarfile.TarInfo):
+              def _proc_member(self, archive):
+                  # Bound extension headers before tarfile allocates their payloads.
+                  if self.type in (tarfile.XHDTYPE, tarfile.XGLTYPE, tarfile.GNUTYPE_LONGNAME,
+                                   tarfile.GNUTYPE_LONGLINK) and self.size > 1024**2:
+                      raise ValueError("Layer extension header exceeds 1 MiB")
+                  if self.type == tarfile.GNUTYPE_SPARSE:
+                      raise ValueError("Sparse layer entries are unsupported")
+                  return super()._proc_member(archive)
+
+
+          def layer_entries(path, media_type):
+              types = {
+                  "application/vnd.oci.image.layer.v1.tar": False,
+                  "application/vnd.oci.image.layer.v1.tar+gzip": True,
+                  "application/vnd.oci.image.layer.nondistributable.v1.tar": False,
+                  "application/vnd.oci.image.layer.nondistributable.v1.tar+gzip": True,
+                  "application/vnd.docker.image.rootfs.diff.tar": False,
+                  "application/vnd.docker.image.rootfs.diff.tar.gzip": True,
+                  "application/vnd.docker.image.rootfs.foreign.diff.tar.gzip": True,
+              }
+              if "zstd" in media_type:
+                  raise ValueError("zstd layers are unsupported; build with gzip or uncompressed layers")
+              if media_type not in types:
+                  raise ValueError("Unsupported static asset layer media type")
+              with path.open("rb") as raw:
+                  with gzip.GzipFile(fileobj=raw) if types[media_type] else raw as source:
+                      with tarfile.open(fileobj=LimitedReader(source), mode="r|", tarinfo=AssetTarInfo) as archive:
+                          for count, member in enumerate(archive, 1):
+                              if count > MAX_ENTRIES:
+                                  raise ValueError("Too many layer entries")
+                              if (member.name.startswith("/") or ".." in member.name.split("/")
+                                      or any(c in member.name for c in "\0\r\n")):
+                                  raise ValueError("Unsafe layer path")
+                              name = "/".join(part for part in member.name.split("/") if part not in ("", "."))
+                              if len(name.encode("utf-8", errors="strict")) > 4096:
+                                  raise ValueError("Layer path exceeds 4096 UTF-8 bytes")
+                              if member.size < 0 or member.sparse is not None:
+                                  raise ValueError("Invalid or sparse layer entry")
+                              yield archive, member, name
+                              archive.members.clear()
+
+
+          def collect_assets(root, asset_path, scratch):
+              target = asset_path.strip("/")
+              nodes = {}  # Image paths are keys only; temp files have generated names.
+              total = 0
+              file_count = 0
+
+              def within(name, parent):
+                  return not parent or name == parent or name.startswith(parent + "/")
+
+              def relevant(name):
+                  return within(name, target) or within(target, name)
+
+              def remove(name, descendants_only=False):
+                  nonlocal total, file_count
+                  if name not in nodes:
+                      return
+                  keys = [name] if nodes[name] is not None else list(nodes)
+                  for key in keys:
+                      if within(key, name) and (not descendants_only or key != name):
+                          value = nodes.pop(key)
+                          if value is not None:
+                              path, size = value
+                              path.unlink()
+                              total -= size
+                              file_count -= 1
+
+              def directories(name):
+                  parts = name.split("/") if name else []
+                  for count in range(len(parts) + 1):
+                      parent = "/".join(parts[:count])
+                      if nodes.get(parent) is not None:
+                          remove(parent)
+                      nodes[parent] = None
+                  if len(nodes) > MAX_ENTRIES:
+                      raise ValueError("Too many static asset paths")
+
+              for layer in selected_layers(root):
+                  path = blob(root, layer)
+                  # Whiteouts apply only to older layers, regardless of tar entry order.
+                  for _, member, name in layer_entries(path, layer["mediaType"]):
+                      parent, _, leaf = name.rpartition("/")
+                      if leaf.startswith(".wh."):
+                          if not member.isfile() or member.size != 0:
+                              raise ValueError("Invalid OCI whiteout")
+                          if leaf == ".wh..wh..opq":
+                              remove(parent, descendants_only=True)
+                          else:
+                              victim = leaf[4:]
+                              if victim in ("", ".", ".."):
+                                  raise ValueError("Invalid OCI whiteout name")
+                              remove((parent + "/" if parent else "") + victim)
+                  for archive, member, name in layer_entries(path, layer["mediaType"]):
+                      parent, _, leaf = name.rpartition("/")
+                      if leaf.startswith(".wh."):
+                          if relevant(parent):
+                              directories(parent)
+                          continue
+                      if not relevant(name):
+                          continue
+                      if member.isdir():
+                          directories(name)
+                          continue
+                      # Reject links/devices at the root and ancestors too; never resolve them.
+                      if not member.isfile():
+                          raise ValueError("Links and special files are forbidden in the static asset path or ancestors")
+                      if not within(name, target) or name == target:
+                          raise ValueError("Static asset path and ancestors must be directories")
+                      remove(name)
+                      directories(parent)
+                      if member.size > MAX_FILE:
+                          raise ValueError("Static asset exceeds 50 MiB")
+                      if total + member.size > MAX_TOTAL:
+                          raise ValueError("Static assets exceed 2 GiB")
+                      if file_count >= MAX_FILES:
+                          raise ValueError("Static assets exceed 20000 files")
+                      if len(nodes) >= MAX_ENTRIES:
+                          raise ValueError("Too many static asset paths")
+                      with tempfile.NamedTemporaryFile(dir=scratch, delete=False) as output:
+                          with archive.extractfile(member) as incoming:
+                              remaining = member.size
+                              while remaining:
+                                  chunk = incoming.read(min(1024**2, remaining))
+                                  if not chunk:
+                                      raise ValueError("Truncated static asset")
+                                  output.write(chunk)
+                                  remaining -= len(chunk)
+                          nodes[name] = (Path(output.name), member.size)
+                      total += member.size
+                      file_count += 1
+              if target not in nodes:
+                  raise ValueError("Static asset path does not exist in the image")
+              files = {name[len(target) + 1:] if target else name: value[0]
+                       for name, value in nodes.items() if value is not None}
+              if not files:
+                  raise ValueError("Static asset path contains zero files")
+              return files
+
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+
+
+          def upload_assets(files, destination, token, base_url, deadline):
+              # Only the local test harness may use HTTP. No caller input selects an endpoint.
+              if base_url != "https://storage.googleapis.com" and not re.fullmatch(r"http://127\.0\.0\.1:[0-9]+", base_url):
+                  raise ValueError("Unsupported GCS API endpoint")
+              bucket, _, prefix = destination.removeprefix("gs://").partition("/")
+              bucket_url = urllib.parse.quote(bucket, safe="")
+
+              def request(method, path, body=None, content_type=None):
+                  for attempt in range(6):
+                      remaining = deadline - time.monotonic()
+                      if remaining <= 0:
+                          raise ValueError("Static asset upload timed out")
+                      headers = {"Authorization": "Bearer " + token}
+                      if content_type:
+                          headers["Content-Type"] = content_type
+                      req = urllib.request.Request(base_url + path, data=body, headers=headers, method=method)
+                      try:
+                          # Default HTTPS handler verifies TLS. Refuse redirects and ambient proxies.
+                          opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+                          with opener.open(req, timeout=min(30, remaining)) as response:
+                              data = response.read(1024**2 + 1)
+                              if len(data) > 1024**2:
+                                  raise ValueError("GCS response is too large")
+                              return response.status, json.loads(data)
+                      except urllib.error.HTTPError as error:
+                          status = error.code
+                          error.close()
+                          if status == 412 and method == "POST":
+                              return status, None
+                          if status != 429 and not 500 <= status <= 599:
+                              raise ValueError(f"GCS request failed (HTTP {status})") from None
+                      except (urllib.error.URLError, OSError, http.client.HTTPException):
+                          pass
+                      if attempt == 5:
+                          raise ValueError("GCS request failed after 6 attempts")
+                      time.sleep(min(2**attempt, max(0, deadline - time.monotonic())))
+                  raise AssertionError("Unreachable retry state")
+
+              def upload(item):
+                  relative, path = item
+                  name = prefix + "/" + relative if prefix else relative
+                  original = path.read_bytes()
+                  extension = relative.rsplit(".", 1)[-1].lower()
+                  content_type = CONTENT_TYPES.get(extension, "application/octet-stream")
+                  data = original
+                  if extension in COMPRESS:
+                      buffer = io.BytesIO()
+                      # GzipFile keeps the OS byte stable across Python versions too.
+                      with gzip.GzipFile(filename="", mode="wb", compresslevel=9, fileobj=buffer, mtime=0) as encoded:
+                          encoded.write(original)
+                      data = buffer.getvalue()
+                  sha256 = hashlib.sha256(original).hexdigest()
+                  md5 = base64.b64encode(hashlib.md5(data, usedforsecurity=False).digest()).decode()
+                  metadata = {"name": name, "contentType": content_type, "cacheControl": CACHE_CONTROL,
+                              "metadata": {"original-sha256": sha256}, "md5Hash": md5}
+                  if extension in COMPRESS:
+                      metadata["contentEncoding"] = "gzip"
+                  boundary = uuid.uuid4().hex
+                  body = (f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n".encode()
+                          + json.dumps(metadata).encode()
+                          + f"\r\n--{boundary}\r\nContent-Type: application/octet-stream\r\n\r\n".encode()
+                          + data + f"\r\n--{boundary}--\r\n".encode())
+                  query = urllib.parse.urlencode({"uploadType": "multipart", "ifGenerationMatch": "0", "name": name})
+                  status, _ = request("POST", f"/upload/storage/v1/b/{bucket_url}/o?{query}",
+                                      body, f"multipart/related; boundary={boundary}")
+                  if status == 412:
+                      _, existing = request("GET", f"/storage/v1/b/{bucket_url}/o/" + urllib.parse.quote(name, safe=""))
+                      # The stored-byte hash also protects against stale custom metadata.
+                      if (existing.get("metadata", {}).get("original-sha256") != sha256
+                              or existing.get("md5Hash") != md5
+                              or existing.get("contentType") != content_type
+                              or existing.get("cacheControl") != CACHE_CONTROL
+                              or existing.get("contentEncoding", "") != metadata.get("contentEncoding", "")):
+                          raise ValueError("Existing GCS object differs in content or serving metadata")
+                      return 0, 1, 0
+                  return 1, 0, len(data)
+
+              with ThreadPoolExecutor(max_workers=8) as pool:
+                  results = list(pool.map(upload, files.items()))
+              uploaded, present, byte_count = (sum(values) for values in zip(*results))
+              print(f"Static assets to {destination}: uploaded={uploaded} already-present={present} bytes={byte_count}")
+
+
+          def main():
+              def timed_out(signum, frame):
+                  # A hard deadline also bounds a peer that trickles response bytes forever.
+                  os.write(2, b"Static asset processing exceeded 600 seconds\n")
+                  os._exit(1)
+
+              signal.signal(signal.SIGALRM, timed_out)
+              signal.alarm(TIMEOUT)
+              deadline = time.monotonic() + TIMEOUT
+              temp = Path(os.environ["RUNNER_TEMP"])
+              try:
+                  with tempfile.TemporaryDirectory(prefix="static-assets-", dir=temp) as scratch:
+                      files = collect_assets(temp / "publish-oci", os.environ["STATIC_ASSETS_PATH"], scratch)
+                      upload_assets(files, os.environ["STATIC_ASSETS_DESTINATION"], os.environ["ACCESS_TOKEN"],
+                                    os.environ.get("GCS_BASE_URL", "https://storage.googleapis.com"), deadline)
+              except (ValueError, OSError, tarfile.TarError, EOFError, http.client.HTTPException) as error:
+                  # Do not print exception text from transports or caller-controlled tar data.
+                  if type(error) is ValueError:
+                      raise SystemExit(str(error)) from None
+                  raise SystemExit("Static asset processing failed (invalid layer or I/O error)") from None
+              finally:
+                  signal.alarm(0)
+
+
+          if __name__ == "__main__":
+              main()
+          PY
 
       - name: Push image and record the registry digest
         id: push

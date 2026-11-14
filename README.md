@@ -85,6 +85,8 @@ jobs:
 | `moving-tags` | empty | Newline-separated subset of `tags` that may change digest |
 | `platforms` | empty | Newline-separated `linux/amd64` and/or `linux/arm64`; empty preserves the original single build |
 | `build-args` | empty | Newline-separated literal `KEY=VALUE` pairs; public values only |
+| `static-assets-path` | empty | Absolute directory in the image, e.g. `/app/.next/static`; requires `static-assets-destination` |
+| `static-assets-destination` | empty | GCS bucket and optional prefix, e.g. `gs://example-static-bucket/_next/static`; requires `static-assets-path` |
 | `environment` | (required) | Environment of the publish job (deployment branch policy) |
 | `build-environment` | `<environment>-build` | Environment of the build job; holds build variables and secrets. Must differ from `environment` |
 | `context` | `.` | Build context within the checkout |
@@ -124,6 +126,89 @@ names. Without `image-name`, retain one image per environment per workflow run.
 Outputs remain `digest` and `image` (`<effective-image>@<digest>`). When
 `platforms` is set, the digest and signature identify the index. Otherwise they
 identify the original single-build result.
+
+### Static assets across rolling deployments
+
+Set both static asset inputs to upload the image's content-hashed assets to a
+shared bucket that retains all builds. Both default to empty: the upload step is
+skipped and existing publishing behavior is unchanged. Paths must be absolute,
+without `..` segments, NUL or newlines. Destinations must be `gs://BUCKET/PREFIX`
+with a lowercase bucket name (3–63 characters, letters, digits, `.`, `_`, `-`;
+first and last characters alphanumeric) and a prefix containing only letters,
+digits, `.`, `_`, `~`, `/`, `-`, without `..` segments. Repeated slashes, `.`
+segments and trailing slashes are normalized before publishing.
+
+The publish job reads the verified OCI layout without running the image or any
+caller code. It selects `linux/amd64` when available, otherwise the single image;
+multi-platform callers must produce identical static assets on every platform.
+Layers are applied in order, including file and ancestor whiteouts and opaque
+directories. Gzip and uncompressed tar layers are supported; zstd layers fail
+clearly. Only regular files are uploaded. Symlinks, hardlinks and special files
+in the selected directory or its ancestors fail the job, even if a later layer
+would remove them. Absolute or traversing tar paths and sparse entries are
+rejected. Duplicate file entries use the last occurrence; later layers win.
+A missing directory or one with zero files fails the job.
+
+Limits are 50 MiB per file, 2 GiB of retained uncompressed assets and 20,000
+retained files, enforced while applying layers. Parsing also limits each expanded
+layer to 10 GiB, each layer and retained path set to 200,000 entries, tar paths to
+4096 UTF-8 bytes, and extension headers to 1 MiB. Asset processing and upload have
+a ten-minute overall deadline, with eight upload workers and bounded retries for
+transient failures.
+
+Uploads finish **before any image push or tag update**. A failure prevents the
+push and signing steps. Objects are created with `ifGenerationMatch=0`: existing
+objects are skipped only when the original SHA-256, stored-byte MD5 and serving
+metadata match; a collision fails the job. Objects are never overwritten or
+deleted. Partial uploads from a failed run can be safely retried. Files receive
+extension-specific content types and `Cache-Control: public, max-age=31536000,
+immutable`. JS/MJS, CSS, source maps, JSON, SVG, TXT, HTML and WASM are stored as
+deterministic gzip bytes with `Content-Encoding: gzip`.
+
+Grant the publisher service account **`storage.objects.create` and
+`storage.objects.get` on the bucket**, in addition to its existing registry
+permissions. A custom role containing those two storage permissions is
+sufficient; listing, updating and deleting objects are unnecessary. Authentication
+uses the existing short-lived access token, with no credentials file or cloud
+environment export. The build job receives no cloud credentials.
+
+The bucket must be browser-readable at the configured asset URL. Configure bucket
+CORS for the app's origins, including font requests. Retain old build objects for
+as long as clients may use them; the workflow performs no cleanup. Use this only
+for public, content-hashed assets: a changed file at an existing object name is a
+collision, not an update.
+
+Example caller (publisher settings are caller-provided variables):
+
+```yaml
+permissions: {}
+
+jobs:
+  publish:
+    permissions:
+      contents: read
+      id-token: write
+    uses: Blockstream/ci-components/.github/workflows/publish.yml@v1
+    with:
+      workload-identity-provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      service-account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+      image: ${{ vars.IMAGE_NAME }}
+      environment: production
+      static-assets-path: /app/.next/static
+      static-assets-destination: gs://example-static-bucket/_next/static
+```
+
+Set the corresponding Next.js prefix at build time in `next.config.mjs`:
+
+```javascript
+export default {
+  assetPrefix: 'https://storage.googleapis.com/example-static-bucket',
+};
+```
+
+Next.js appends `/_next/static/...` to this prefix. The final Docker image must
+contain `/app/.next/static`. This publishes that directory only; arrange separate
+hosting for any other assets your application needs.
 
 ### Publisher secrets
 
