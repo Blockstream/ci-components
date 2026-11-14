@@ -132,7 +132,7 @@ identify the original single-build result.
 Set both static asset inputs to upload the image's content-hashed assets to a
 shared bucket that retains all builds. Both default to empty: the upload step is
 skipped and existing publishing behavior is unchanged. Paths must be absolute,
-without `..` segments, NUL or newlines. Destinations must be `gs://BUCKET/PREFIX`
+without `..` segments or control characters. Destinations must be `gs://BUCKET/PREFIX`
 with a lowercase bucket name (3–63 characters, letters, digits, `.`, `_`, `-`;
 first and last characters alphanumeric) and a prefix containing only letters,
 digits, `.`, `_`, `~`, `/`, `-`, without `..` segments. Repeated slashes, `.`
@@ -156,10 +156,13 @@ A missing directory or one with zero files fails the job.
 Limits are 50 MiB per file, 2 GiB of retained uncompressed assets and 20,000
 retained files, enforced while applying layers. Parsing also limits each expanded
 layer to 10 GiB, each layer and retained path set to 200,000 entries, tar paths to
-4096 UTF-8 bytes, and extension headers to 1 MiB. Asset processing and upload have
+4096 UTF-8 bytes, and extension headers to 1 MiB. The entry, UTF-8 and newline
+checks apply to every layer of the image, not only to the asset directory, so an
+image with a larger layer or non-UTF-8 file names cannot use this feature. Asset processing and upload have
 a ten-minute overall deadline, with eight upload workers and bounded retries for
 transient failures. The upload step allows up to 11 minutes; the publish job has
-a 35-minute timeout to leave room for the remaining publishing steps.
+a 35-minute timeout to leave room for the remaining publishing steps (20 minutes,
+as before, when the static asset inputs are not set).
 
 Uploads finish **before any image push or tag update**. A failure prevents the
 push and signing steps. Objects are created with `ifGenerationMatch=0`: existing
@@ -168,7 +171,7 @@ and their stored-byte MD5 matches. If gzip bytes differ, a bounded download must
 match the object's stored-byte MD5 and decompress to the same original SHA-256;
 this allows compression-library changes. Any content or serving-metadata
 collision fails the job and names the object (URL-quoted and truncated to 300
-characters). Objects are never overwritten or deleted. Partial uploads from a
+characters). An existing object must also have no `Content-Disposition` or `Content-Language`. Objects are never overwritten or deleted. Partial uploads from a
 failed run can be safely retried. Use a separate bucket or prefix for each trust
 level, such as staging and production. To recover from a collision, an operator
 must delete the colliding objects before retrying; the publisher identity cannot

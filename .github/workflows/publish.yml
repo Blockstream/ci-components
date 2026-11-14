@@ -204,8 +204,8 @@ jobs:
               raise SystemExit("static assets support single-platform builds only")
           if asset_path:
               if (not asset_path.startswith("/") or ".." in asset_path.split("/")
-                      or any(c in asset_path for c in "\0\r\n")):
-                  raise SystemExit("static-assets-path must be absolute without '..', NUL or newlines")
+                      or any(ord(c) < 0x20 or ord(c) == 0x7F for c in asset_path)):
+                  raise SystemExit("static-assets-path must be absolute without '..' or control characters")
               asset_path = "/" + "/".join(part for part in asset_path.split("/") if part not in ("", "."))
               if (not re.fullmatch(r"gs://[a-z0-9][a-z0-9._-]{1,61}[a-z0-9](/[A-Za-z0-9._~/-]*)?", asset_destination)
                       or ".." in asset_destination.removeprefix("gs://").split("/")):
@@ -384,7 +384,8 @@ jobs:
   publish:
     needs: [prepare, build]
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    # The static-asset upload can take up to 11 minutes; other callers keep 20.
+    timeout-minutes: ${{ inputs.static-assets-path != '' && 35 || 20 }}
     environment: ${{ inputs.environment }}
     permissions:
       contents: read
@@ -1026,7 +1027,8 @@ jobs:
                               or not existing.get("md5Hash")
                               or existing.get("contentType") != content_type
                               or existing.get("cacheControl") != CACHE_CONTROL
-                              or existing.get("contentEncoding", "") != metadata.get("contentEncoding", "")):
+                              or existing.get("contentEncoding", "") != metadata.get("contentEncoding", "")
+                              or existing.get("contentDisposition") or existing.get("contentLanguage")):
                           raise AssetError(collision)
                       if existing["md5Hash"] != md5:
                           if metadata.get("contentEncoding") != "gzip":
