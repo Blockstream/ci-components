@@ -380,7 +380,7 @@ jobs:
   publish:
     needs: [prepare, build]
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 35
     environment: ${{ inputs.environment }}
     permissions:
       contents: read
@@ -691,7 +691,7 @@ jobs:
             --username oauth2accesstoken --password-stdin
 
       - name: Upload static assets before publishing the image
-        if: needs.prepare.outputs.static-assets-path != ''
+        if: inputs.static-assets-path != '' || inputs.static-assets-destination != ''
         timeout-minutes: 11
         env:
           STATIC_ASSETS_PATH: ${{ needs.prepare.outputs.static-assets-path }}
@@ -703,7 +703,7 @@ jobs:
           set -euo pipefail
           python3 -I - <<'PY'
           import base64
-          from concurrent.futures import ThreadPoolExecutor
+          from concurrent.futures import ThreadPoolExecutor, as_completed
           import gzip
           import hashlib
           import http.client
@@ -720,6 +720,7 @@ jobs:
           import urllib.parse
           import urllib.request
           import uuid
+          import zlib
 
           MAX_FILE = 50 * 1024**2
           MAX_TOTAL = 2 * 1024**3
@@ -740,14 +741,18 @@ jobs:
           COMPRESS = {"js", "mjs", "css", "map", "json", "svg", "txt", "html", "wasm"}
 
 
+          class AssetError(Exception):
+              pass
+
+
           def blob(root, descriptor):
               # Unpack has already hashed every blob and validated all descriptors.
               digest = descriptor["digest"]
               if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
-                  raise ValueError("Invalid static asset blob digest")
+                  raise AssetError("Invalid static asset blob digest")
               path = root / "blobs/sha256" / digest.split(":")[1]
               if path.stat().st_size != descriptor["size"]:
-                  raise ValueError("Static asset blob size mismatch")
+                  raise AssetError("Static asset blob size mismatch")
               return path
 
 
@@ -761,7 +766,7 @@ jobs:
               elif len(manifests) == 1:
                   descriptor = manifests[0]
               else:
-                  raise ValueError("Static assets require linux/amd64 or a single image")
+                  raise AssetError("Static assets require linux/amd64 or a single image")
               return json.loads(blob(root, descriptor).read_bytes())["layers"]
 
 
@@ -773,18 +778,28 @@ jobs:
                   data = self.source.read(size)
                   self.total += len(data)
                   if self.total > MAX_LAYER:
-                      raise ValueError("Expanded layer exceeds 10 GiB")
+                      raise AssetError("Expanded layer exceeds 10 GiB")
                   return data
 
 
           class AssetTarInfo(tarfile.TarInfo):
+              # Reject PAX sparse maps before tarfile parses or allocates them.
+              def _proc_gnusparse_00(self, next, raw_headers):
+                  raise AssetError("Sparse layer entries are unsupported")
+
+              def _proc_gnusparse_01(self, next, pax_headers):
+                  raise AssetError("Sparse layer entries are unsupported")
+
+              def _proc_gnusparse_10(self, next, pax_headers, archive):
+                  raise AssetError("Sparse layer entries are unsupported")
+
               def _proc_member(self, archive):
                   # Bound extension headers before tarfile allocates their payloads.
                   if self.type in (tarfile.XHDTYPE, tarfile.XGLTYPE, tarfile.GNUTYPE_LONGNAME,
                                    tarfile.GNUTYPE_LONGLINK) and self.size > 1024**2:
-                      raise ValueError("Layer extension header exceeds 1 MiB")
+                      raise AssetError("Layer extension header exceeds 1 MiB")
                   if self.type == tarfile.GNUTYPE_SPARSE:
-                      raise ValueError("Sparse layer entries are unsupported")
+                      raise AssetError("Sparse layer entries are unsupported")
                   return super()._proc_member(archive)
 
 
@@ -799,23 +814,23 @@ jobs:
                   "application/vnd.docker.image.rootfs.foreign.diff.tar.gzip": True,
               }
               if "zstd" in media_type:
-                  raise ValueError("zstd layers are unsupported; build with gzip or uncompressed layers")
+                  raise AssetError("zstd layers are unsupported; build with gzip or uncompressed layers")
               if media_type not in types:
-                  raise ValueError("Unsupported static asset layer media type")
+                  raise AssetError("Unsupported static asset layer media type")
               with path.open("rb") as raw:
                   with gzip.GzipFile(fileobj=raw) if types[media_type] else raw as source:
                       with tarfile.open(fileobj=LimitedReader(source), mode="r|", tarinfo=AssetTarInfo) as archive:
                           for count, member in enumerate(archive, 1):
                               if count > MAX_ENTRIES:
-                                  raise ValueError("Too many layer entries")
+                                  raise AssetError("Too many layer entries")
                               if (member.name.startswith("/") or ".." in member.name.split("/")
                                       or any(c in member.name for c in "\0\r\n")):
-                                  raise ValueError("Unsafe layer path")
+                                  raise AssetError("Unsafe layer path")
                               name = "/".join(part for part in member.name.split("/") if part not in ("", "."))
                               if len(name.encode("utf-8", errors="strict")) > 4096:
-                                  raise ValueError("Layer path exceeds 4096 UTF-8 bytes")
+                                  raise AssetError("Layer path exceeds 4096 UTF-8 bytes")
                               if member.size < 0 or member.sparse is not None:
-                                  raise ValueError("Invalid or sparse layer entry")
+                                  raise AssetError("Invalid or sparse layer entry")
                               yield archive, member, name
                               archive.members.clear()
 
@@ -854,7 +869,7 @@ jobs:
                           remove(parent)
                       nodes[parent] = None
                   if len(nodes) > MAX_ENTRIES:
-                      raise ValueError("Too many static asset paths")
+                      raise AssetError("Too many static asset paths")
 
               for layer in selected_layers(root):
                   path = blob(root, layer)
@@ -863,13 +878,13 @@ jobs:
                       parent, _, leaf = name.rpartition("/")
                       if leaf.startswith(".wh."):
                           if not member.isfile() or member.size != 0:
-                              raise ValueError("Invalid OCI whiteout")
+                              raise AssetError("Invalid OCI whiteout")
                           if leaf == ".wh..wh..opq":
                               remove(parent, descendants_only=True)
                           else:
                               victim = leaf[4:]
                               if victim in ("", ".", ".."):
-                                  raise ValueError("Invalid OCI whiteout name")
+                                  raise AssetError("Invalid OCI whiteout name")
                               remove((parent + "/" if parent else "") + victim)
                   for archive, member, name in layer_entries(path, layer["mediaType"]):
                       parent, _, leaf = name.rpartition("/")
@@ -884,37 +899,37 @@ jobs:
                           continue
                       # Reject links/devices at the root and ancestors too; never resolve them.
                       if not member.isfile():
-                          raise ValueError("Links and special files are forbidden in the static asset path or ancestors")
+                          raise AssetError("Links and special files are forbidden in the static asset path or ancestors")
                       if not within(name, target) or name == target:
-                          raise ValueError("Static asset path and ancestors must be directories")
+                          raise AssetError("Static asset path and ancestors must be directories")
                       remove(name)
                       directories(parent)
                       if member.size > MAX_FILE:
-                          raise ValueError("Static asset exceeds 50 MiB")
+                          raise AssetError("Static asset exceeds 50 MiB")
                       if total + member.size > MAX_TOTAL:
-                          raise ValueError("Static assets exceed 2 GiB")
+                          raise AssetError("Static assets exceed 2 GiB")
                       if file_count >= MAX_FILES:
-                          raise ValueError("Static assets exceed 20000 files")
+                          raise AssetError("Static assets exceed 20000 files")
                       if len(nodes) >= MAX_ENTRIES:
-                          raise ValueError("Too many static asset paths")
+                          raise AssetError("Too many static asset paths")
                       with tempfile.NamedTemporaryFile(dir=scratch, delete=False) as output:
                           with archive.extractfile(member) as incoming:
                               remaining = member.size
                               while remaining:
                                   chunk = incoming.read(min(1024**2, remaining))
                                   if not chunk:
-                                      raise ValueError("Truncated static asset")
+                                      raise AssetError("Truncated static asset")
                                   output.write(chunk)
                                   remaining -= len(chunk)
                           nodes[name] = (Path(output.name), member.size)
                       total += member.size
                       file_count += 1
               if target not in nodes:
-                  raise ValueError("Static asset path does not exist in the image")
+                  raise AssetError("Static asset path does not exist in the image")
               files = {name[len(target) + 1:] if target else name: value[0]
                        for name, value in nodes.items() if value is not None}
               if not files:
-                  raise ValueError("Static asset path contains zero files")
+                  raise AssetError("Static asset path contains zero files")
               return files
 
 
@@ -926,40 +941,44 @@ jobs:
           def upload_assets(files, destination, token, base_url, deadline):
               # Only the local test harness may use HTTP. No caller input selects an endpoint.
               if base_url != "https://storage.googleapis.com" and not re.fullmatch(r"http://127\.0\.0\.1:[0-9]+", base_url):
-                  raise ValueError("Unsupported GCS API endpoint")
+                  raise AssetError("Unsupported GCS API endpoint")
               bucket, _, prefix = destination.removeprefix("gs://").partition("/")
               bucket_url = urllib.parse.quote(bucket, safe="")
 
-              def request(method, path, body=None, content_type=None):
+              def request(method, path, body=None, content_type=None, media=False):
                   for attempt in range(6):
                       remaining = deadline - time.monotonic()
                       if remaining <= 0:
-                          raise ValueError("Static asset upload timed out")
+                          raise AssetError("Static asset upload timed out")
                       headers = {"Authorization": "Bearer " + token}
                       if content_type:
                           headers["Content-Type"] = content_type
+                      if media:
+                          # Request stored gzip bytes, without GCS decompressive transcoding.
+                          headers["Accept-Encoding"] = "gzip"
                       req = urllib.request.Request(base_url + path, data=body, headers=headers, method=method)
                       try:
                           # Default HTTPS handler verifies TLS. Refuse redirects and ambient proxies.
                           opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
                           with opener.open(req, timeout=min(30, remaining)) as response:
-                              data = response.read(1024**2 + 1)
-                              if len(data) > 1024**2:
-                                  raise ValueError("GCS response is too large")
-                              return response.status, json.loads(data)
+                              limit = MAX_FILE * 2 if media else 1024**2
+                              data = response.read(limit + 1)
+                              if len(data) > limit:
+                                  raise AssetError("GCS response is too large")
+                              return response.status, data if media else json.loads(data)
                       except urllib.error.HTTPError as error:
                           status = error.code
                           error.close()
                           if status == 412 and method == "POST":
                               return status, None
                           if status != 429 and not 500 <= status <= 599:
-                              raise ValueError(f"GCS request failed (HTTP {status})") from None
+                              raise AssetError(f"GCS request failed (HTTP {status})") from None
                       except (urllib.error.URLError, OSError, http.client.HTTPException):
                           pass
                       if attempt == 5:
-                          raise ValueError("GCS request failed after 6 attempts")
+                          raise AssetError("GCS request failed after 6 attempts")
                       time.sleep(min(2**attempt, max(0, deadline - time.monotonic())))
-                  raise AssertionError("Unreachable retry state")
+                  raise AssetError("Unreachable retry state")
 
               def upload(item):
                   relative, path = item
@@ -989,19 +1008,40 @@ jobs:
                   status, _ = request("POST", f"/upload/storage/v1/b/{bucket_url}/o?{query}",
                                       body, f"multipart/related; boundary={boundary}")
                   if status == 412:
-                      _, existing = request("GET", f"/storage/v1/b/{bucket_url}/o/" + urllib.parse.quote(name, safe=""))
-                      # The stored-byte hash also protects against stale custom metadata.
+                      object_url = f"/storage/v1/b/{bucket_url}/o/" + urllib.parse.quote(name, safe="")
+                      _, existing = request("GET", object_url)
+                      collision = ("Existing GCS object differs in content or serving metadata: "
+                                   + urllib.parse.quote(name, safe="/")[:300])
                       if (existing.get("metadata", {}).get("original-sha256") != sha256
-                              or existing.get("md5Hash") != md5
+                              or not existing.get("md5Hash")
                               or existing.get("contentType") != content_type
                               or existing.get("cacheControl") != CACHE_CONTROL
                               or existing.get("contentEncoding", "") != metadata.get("contentEncoding", "")):
-                          raise ValueError("Existing GCS object differs in content or serving metadata")
+                          raise AssetError(collision)
+                      if existing["md5Hash"] != md5:
+                          if metadata.get("contentEncoding") != "gzip":
+                              raise AssetError(collision)
+                          _, stored = request("GET", object_url + "?alt=media", media=True)
+                          # Verify stored bytes before trusting the original-content metadata.
+                          stored_md5 = base64.b64encode(hashlib.md5(stored, usedforsecurity=False).digest()).decode()
+                          if stored_md5 != existing["md5Hash"]:
+                              raise AssetError(collision)
+                          try:
+                              with gzip.GzipFile(fileobj=io.BytesIO(stored)) as decoded:
+                                  original_stored = decoded.read(MAX_FILE + 1)
+                          except (OSError, EOFError, zlib.error):
+                              raise AssetError(collision) from None
+                          if len(original_stored) > MAX_FILE or hashlib.sha256(original_stored).hexdigest() != sha256:
+                              raise AssetError(collision)
                       return 0, 1, 0
                   return 1, 0, len(data)
 
-              with ThreadPoolExecutor(max_workers=8) as pool:
-                  results = list(pool.map(upload, files.items()))
+              pool = ThreadPoolExecutor(max_workers=8)
+              try:
+                  futures = [pool.submit(upload, item) for item in files.items()]
+                  results = [future.result() for future in as_completed(futures)]
+              finally:
+                  pool.shutdown(wait=True, cancel_futures=True)
               uploaded, present, byte_count = (sum(values) for values in zip(*results))
               print(f"Static assets to {destination}: uploaded={uploaded} already-present={present} bytes={byte_count}")
 
@@ -1015,16 +1055,20 @@ jobs:
               signal.signal(signal.SIGALRM, timed_out)
               signal.alarm(TIMEOUT)
               deadline = time.monotonic() + TIMEOUT
-              temp = Path(os.environ["RUNNER_TEMP"])
               try:
+                  asset_path = os.environ.get("STATIC_ASSETS_PATH", "")
+                  destination = os.environ.get("STATIC_ASSETS_DESTINATION", "")
+                  if not asset_path or not destination:
+                      raise AssetError("Static asset settings did not arrive from prepare")
+                  temp = Path(os.environ["RUNNER_TEMP"])
                   with tempfile.TemporaryDirectory(prefix="static-assets-", dir=temp) as scratch:
-                      files = collect_assets(temp / "publish-oci", os.environ["STATIC_ASSETS_PATH"], scratch)
-                      upload_assets(files, os.environ["STATIC_ASSETS_DESTINATION"], os.environ["ACCESS_TOKEN"],
+                      files = collect_assets(temp / "publish-oci", asset_path, scratch)
+                      upload_assets(files, destination, os.environ["ACCESS_TOKEN"],
                                     os.environ.get("GCS_BASE_URL", "https://storage.googleapis.com"), deadline)
-              except (ValueError, OSError, tarfile.TarError, EOFError, http.client.HTTPException) as error:
+              except AssetError as error:
+                  raise SystemExit(str(error)) from None
+              except Exception:
                   # Do not print exception text from transports or caller-controlled tar data.
-                  if type(error) is ValueError:
-                      raise SystemExit(str(error)) from None
                   raise SystemExit("Static asset processing failed (invalid layer or I/O error)") from None
               finally:
                   signal.alarm(0)

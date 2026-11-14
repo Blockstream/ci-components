@@ -136,11 +136,14 @@ without `..` segments, NUL or newlines. Destinations must be `gs://BUCKET/PREFIX
 with a lowercase bucket name (3–63 characters, letters, digits, `.`, `_`, `-`;
 first and last characters alphanumeric) and a prefix containing only letters,
 digits, `.`, `_`, `~`, `/`, `-`, without `..` segments. Repeated slashes, `.`
-segments and trailing slashes are normalized before publishing.
+segments and trailing slashes are normalized before publishing. If GitHub drops
+a validated prepare output because it contains a registered secret, the upload
+step fails closed instead of skipping assets.
 
 The publish job reads the verified OCI layout without running the image or any
-caller code. It selects `linux/amd64` when available, otherwise the single image;
-multi-platform callers must produce identical static assets on every platform.
+caller code. Only assets from `linux/amd64` when available, otherwise the single
+image, are uploaded. Other platforms are not compared; multi-platform callers
+must produce identical static assets on every platform.
 Layers are applied in order, including file and ancestor whiteouts and opaque
 directories. Gzip and uncompressed tar layers are supported; zstd layers fail
 clearly. Only regular files are uploaded. Symlinks, hardlinks and special files
@@ -154,16 +157,24 @@ retained files, enforced while applying layers. Parsing also limits each expande
 layer to 10 GiB, each layer and retained path set to 200,000 entries, tar paths to
 4096 UTF-8 bytes, and extension headers to 1 MiB. Asset processing and upload have
 a ten-minute overall deadline, with eight upload workers and bounded retries for
-transient failures.
+transient failures. The upload step allows up to 11 minutes; the publish job has
+a 35-minute timeout to leave room for the remaining publishing steps.
 
 Uploads finish **before any image push or tag update**. A failure prevents the
 push and signing steps. Objects are created with `ifGenerationMatch=0`: existing
-objects are skipped only when the original SHA-256, stored-byte MD5 and serving
-metadata match; a collision fails the job. Objects are never overwritten or
-deleted. Partial uploads from a failed run can be safely retried. Files receive
-extension-specific content types and `Cache-Control: public, max-age=31536000,
+objects are skipped only when the original SHA-256 and serving metadata match,
+and their stored-byte MD5 matches. If gzip bytes differ, a bounded download must
+match the object's stored-byte MD5 and decompress to the same original SHA-256;
+this allows compression-library changes. Any content or serving-metadata
+collision fails the job and names the object (URL-quoted and truncated to 300
+characters). Objects are never overwritten or deleted. Partial uploads from a
+failed run can be safely retried. Use a separate bucket or prefix for each trust
+level, such as staging and production. To recover from a collision, an operator
+must delete the colliding objects before retrying; the publisher identity cannot
+delete them. Files receive extension-specific content types and
+`Cache-Control: public, max-age=31536000,
 immutable`. JS/MJS, CSS, source maps, JSON, SVG, TXT, HTML and WASM are stored as
-deterministic gzip bytes with `Content-Encoding: gzip`.
+gzip bytes with a fixed timestamp and `Content-Encoding: gzip`.
 
 Grant the publisher service account **`storage.objects.create` and
 `storage.objects.get` on the bucket**, in addition to its existing registry
