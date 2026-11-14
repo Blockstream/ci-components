@@ -198,6 +198,10 @@ jobs:
           asset_destination = os.environ["STATIC_ASSETS_DESTINATION"]
           if bool(asset_path) != bool(asset_destination):
               raise SystemExit("static-assets-path and static-assets-destination must be set together")
+          if asset_path and len(platforms) > 1:
+              # Each platform builds separately; per-build asset names (e.g. a random build ID)
+              # would differ, and only one platform's assets would be uploaded.
+              raise SystemExit("static assets support single-platform builds only")
           if asset_path:
               if (not asset_path.startswith("/") or ".." in asset_path.split("/")
                       or any(c in asset_path for c in "\0\r\n")):
@@ -795,9 +799,15 @@ jobs:
 
               def _proc_member(self, archive):
                   # Bound extension headers before tarfile allocates their payloads.
-                  if self.type in (tarfile.XHDTYPE, tarfile.XGLTYPE, tarfile.GNUTYPE_LONGNAME,
-                                   tarfile.GNUTYPE_LONGLINK) and self.size > 1024**2:
-                      raise AssetError("Layer extension header exceeds 1 MiB")
+                  if self.type in (tarfile.XHDTYPE, tarfile.XGLTYPE, tarfile.SOLARIS_XHDTYPE,
+                                   tarfile.GNUTYPE_LONGNAME, tarfile.GNUTYPE_LONGLINK):
+                      if not 0 <= self.size <= 1024**2:
+                          raise AssetError("Layer extension header exceeds 1 MiB")
+                      if self.type == tarfile.XGLTYPE:
+                          # Global PAX records persist for the whole layer; bound their total.
+                          archive.asset_global_bytes = getattr(archive, "asset_global_bytes", 0) + self.size
+                          if archive.asset_global_bytes > 1024**2:
+                              raise AssetError("Global PAX headers exceed 1 MiB")
                   if self.type == tarfile.GNUTYPE_SPARSE:
                       raise AssetError("Sparse layer entries are unsupported")
                   return super()._proc_member(archive)
@@ -1047,6 +1057,13 @@ jobs:
 
 
           def main():
+              # The tar limits above override private tarfile hooks; fail closed if a Python
+              # update renamed them instead of silently losing the limits.
+              for hook in ("_proc_member", "_proc_pax", "_proc_gnusparse_00", "_proc_gnusparse_01",
+                           "_proc_gnusparse_10"):
+                  if not callable(getattr(tarfile.TarInfo, hook, None)):
+                      raise SystemExit("Unsupported Python tarfile implementation")
+
               def timed_out(signum, frame):
                   # A hard deadline also bounds a peer that trickles response bytes forever.
                   os.write(2, b"Static asset processing exceeded 600 seconds\n")

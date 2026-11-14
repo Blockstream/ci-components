@@ -141,9 +141,10 @@ a validated prepare output because it contains a registered secret, the upload
 step fails closed instead of skipping assets.
 
 The publish job reads the verified OCI layout without running the image or any
-caller code. Only assets from `linux/amd64` when available, otherwise the single
-image, are uploaded. Other platforms are not compared; multi-platform callers
-must produce identical static assets on every platform.
+caller code. Static assets require a single-platform build: `prepare` rejects
+them together with more than one entry in `platforms`, because separate builds
+can produce different asset names (for example a random build ID) and only one
+platform's assets would be uploaded.
 Layers are applied in order, including file and ancestor whiteouts and opaque
 directories. Gzip and uncompressed tar layers are supported; zstd layers fail
 clearly. Only regular files are uploaded. Symlinks, hardlinks and special files
@@ -172,8 +173,7 @@ failed run can be safely retried. Use a separate bucket or prefix for each trust
 level, such as staging and production. To recover from a collision, an operator
 must delete the colliding objects before retrying; the publisher identity cannot
 delete them. Files receive extension-specific content types and
-`Cache-Control: public, max-age=31536000,
-immutable`. JS/MJS, CSS, source maps, JSON, SVG, TXT, HTML and WASM are stored as
+`Cache-Control: public, max-age=31536000, immutable`. JS/MJS, CSS, source maps, JSON, SVG, TXT, HTML and WASM are stored as
 gzip bytes with a fixed timestamp and `Content-Encoding: gzip`.
 
 Grant the publisher service account **`storage.objects.create` and
