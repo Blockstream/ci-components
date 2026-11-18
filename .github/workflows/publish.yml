@@ -1013,7 +1013,9 @@ jobs:
                   boundary = uuid.uuid4().hex
                   body = (f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n".encode()
                           + json.dumps(metadata).encode()
-                          + f"\r\n--{boundary}\r\nContent-Type: application/octet-stream\r\n\r\n".encode()
+                          # GCS rejects a multipart upload (HTTP 400) when the media part's
+                          # Content-Type differs from the metadata contentType.
+                          + f"\r\n--{boundary}\r\nContent-Type: {content_type}\r\n\r\n".encode()
                           + data + f"\r\n--{boundary}--\r\n".encode())
                   query = urllib.parse.urlencode({"uploadType": "multipart", "ifGenerationMatch": "0", "name": name})
                   status, _ = request("POST", f"/upload/storage/v1/b/{bucket_url}/o?{query}",
